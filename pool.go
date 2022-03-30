@@ -62,7 +62,19 @@ type Pooler interface {
 	Get(ctx context.Context) (*Conn, error)
 
 	Put(*Conn, error)
+
+	Close() error
+
+	State() *State
+
+	IdleNum() int
+
+	WaiterNum() int
+
+	ConnNum() int
 }
+
+var _ Pooler = (*ConnPool)(nil)
 
 type ConnPool struct {
 
@@ -112,6 +124,7 @@ func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
 		select {
 		default:
 		case <-ctx.Done():
+			p.poolMu.Unlock()
 			return nil, ctx.Err()
 		}
 
@@ -178,15 +191,6 @@ func (p *ConnPool) waitIdleConn(ctx context.Context) (*Conn, error) {
 		p.poolMu.Lock()
 		p.waiterNum--
 		p.poolMu.Unlock()
-		select {
-		default:
-		case cn := <-p.waitReqs:
-			p.poolMu.Lock()
-			if cn != nil {
-				p.addNewIdleConnLocked(cn)
-			}
-			p.poolMu.Unlock()
-		}
 		return nil, ctx.Err()
 	case conn := <-p.waitReqs:
 		atomic.AddInt64(&p.waitTime, int64(time.Since(waitStart)/time.Millisecond))
@@ -222,7 +226,41 @@ func (p *ConnPool) notifyWaitReqLocked(conn *Conn) bool {
 }
 
 func (p *ConnPool) Put(conn *Conn, err error) {
+	if p.isClosed() {
+		_ = conn.Close()
+		return
+	}
 
+	if err != nil || !p.isValidConn(conn) {
+		_ = p.closeConn(conn)
+		p.poolMu.Lock()
+		p.connNums--
+		if p.waiterNum > 0 || p.connNums < p.opt.PoolSize && len(p.idleConns) < p.opt.MinIdleSize {
+			p.connNums++
+			p.keepIdleConn()
+		}
+		p.poolMu.Unlock()
+	}
+
+	p.poolMu.Lock()
+	if p.notifyWaitReqLocked(conn) {
+		p.poolMu.Unlock()
+		return
+	}
+
+	if p.connNums <= p.opt.PoolSize {
+		p.idleConns = append(p.idleConns, conn)
+		p.poolMu.Unlock()
+	}
+
+	p.poolMu.Unlock()
+	logger.Errorf("put to manny conn %d", conn.Id())
+
+	_ = p.closeConn(conn)
+}
+
+func (p *ConnPool) closeConn(conn *Conn) error {
+	return conn.Close()
 }
 
 func (p *ConnPool) addNewIdleConnLocked(conn *Conn) {
@@ -292,4 +330,65 @@ func (p *ConnPool) keepIdleConn() {
 
 func (p *ConnPool) isClosed() bool {
 	return atomic.LoadInt32(&p.closed) == 1
+}
+
+func (p *ConnPool) IdleNum() int {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+	return len(p.idleConns)
+}
+
+func (p *ConnPool) WaiterNum() int {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+	return p.waiterNum
+}
+
+func (p *ConnPool) ConnNum() int {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+	return p.connNums
+}
+
+func (p *ConnPool) State() *State {
+	p.poolMu.Lock()
+	idleNum := len(p.idleConns)
+	waiterNum := p.waiterNum
+	keeperNum := len(p.idleKeeper)
+	connNums := p.connNums
+	p.poolMu.Unlock()
+
+	return &State{
+		WaitTimeMs:       atomic.LoadInt64(&p.waitTime),
+		IdleNum:          idleNum,
+		ConnNum:          connNums,
+		WaiterNum:        waiterNum,
+		DialErrNum:       atomic.LoadInt32(&p.dialErrNum),
+		KeeperNum:        keeperNum,
+		MaxAgeClosedNum:  atomic.LoadInt32(&p.maxAgeNum),
+		MaxIdleClosedNum: atomic.LoadInt32(&p.maxIdleNum),
+	}
+}
+
+func (p *ConnPool) Close() error {
+	if p.isClosed() {
+		return ClosedError
+	}
+	atomic.StoreInt32(&p.closed, 0)
+
+	close(p.closeChan)
+
+	var closeErr error
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+	for _, cn := range p.idleConns {
+		if err := p.closeConn(cn); err != nil && closeErr != nil {
+			closeErr = err
+		}
+	}
+
+	p.idleConns = nil
+	p.connNums = 0
+	p.waiterNum = 0
+	return closeErr
 }
