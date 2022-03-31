@@ -25,7 +25,6 @@ func NewConn(conn net.Conn) *Conn {
 		createTime:     time.Now(),
 		lastActiveTime: time.Now().Unix(),
 		id:             atomic.AddInt32(&atomicId, 1),
-		isBadConn:      1,
 	}
 
 	return c

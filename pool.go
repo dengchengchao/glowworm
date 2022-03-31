@@ -110,7 +110,7 @@ func NewConnPool(opt *Options) Pooler {
 		waitReqs:   make(chan *Conn),
 	}
 	p.newIdleConn()
-	go p.keepIdleConn()
+	go p.onCheckIdleConn()
 	return p
 }
 
@@ -167,7 +167,7 @@ func (p *ConnPool) freeIdleConnLocked() (*Conn, bool) {
 			p.connNums++
 			p.keepIdleConn()
 		}
-		return nil, false
+		return conn, false
 	}
 	return conn, true
 }
@@ -188,6 +188,13 @@ func (p *ConnPool) waitIdleConn(ctx context.Context) (*Conn, error) {
 	waitStart := time.Now()
 	select {
 	case <-ctx.Done():
+		select {
+		default:
+		case conn := <-p.waitReqs:
+			if conn != nil {
+				p.addNewIdleConnLocked(conn)
+			}
+		}
 		p.poolMu.Lock()
 		p.waiterNum--
 		p.poolMu.Unlock()
@@ -251,6 +258,7 @@ func (p *ConnPool) Put(conn *Conn, err error) {
 	if p.connNums <= p.opt.PoolSize {
 		p.idleConns = append(p.idleConns, conn)
 		p.poolMu.Unlock()
+		return
 	}
 
 	p.poolMu.Unlock()
@@ -326,6 +334,33 @@ func (p *ConnPool) tryDial() {
 func (p *ConnPool) keepIdleConn() {
 	logger.Debug("receive keep idle request")
 	p.idleKeeper <- struct{}{}
+}
+
+func (p *ConnPool) onCheckIdleConn() {
+	for {
+		select {
+		case <-p.closeChan:
+			return
+
+		case <-p.idleKeeper:
+			if p.isClosed() {
+				return
+			}
+			if atomic.LoadInt32(&p.dialErrNum) >= int32(p.opt.PoolSize) {
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			conn, err := p.newConn()
+			if err != nil {
+				p.keepIdleConn()
+			} else {
+				p.poolMu.Lock()
+				p.addNewIdleConnLocked(conn)
+				p.poolMu.Unlock()
+			}
+
+		}
+	}
 }
 
 func (p *ConnPool) isClosed() bool {
